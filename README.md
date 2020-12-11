@@ -1,4 +1,4 @@
-Virtual Framebuffer driver:
+# Virtual Framebuffer driver:
 
 The VFB driver is a very basic framebuffer driver that allows creation and management
 of an arbitrary number of framebuffer devices.
@@ -20,3 +20,11 @@ number of virtual framebuffers which will be created. The default size of the
 framebuffers is 128x128 16bpp, but this can be reconfigured using fbset after
 the module is loaded. Most preferable way would be having it in userspace.
 
+# How-To
+
+I've updated this very old standalone module to build the latest in-kernel source (vfb.c) from 5.6.0 instead.
+To use for debugging framebuffer applications on plain Ubuntu:
+
+  * sudo insmod virtual_fb.ko vfb_enable=1
+  * x11vnc -rawfb map:/dev/fb0@640x480x32
+  * vinagre localhost:5900
