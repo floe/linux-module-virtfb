@@ -1,498 +1,551 @@
 /*
- * Copyright 2004-2013 Freescale Semiconductor, Inc. All Rights Reserved.
- */
-
-/*
- * The code contained herein is licensed under the GNU General Public
- * License. You may obtain a copy of the GNU General Public License
- * Version 2 or later at the following locations:
+ *  linux/drivers/video/vfb.c -- Virtual frame buffer device
  *
- * http://www.opensource.org/licenses/gpl-license.html
- * http://www.gnu.org/copyleft/gpl.html
- */
-
-/*!
- * @defgroup Framebuffer Framebuffer Driver for surface sharing.
- */
-
-/*!
- * @file virtual_fb.c 
+ *      Copyright (C) 2002 James Simmons
  *
- * @brief Virtual Frame buffer driver for surface sharing
+ *	Copyright (C) 1997 Geert Uytterhoeven
  *
- * @ingroup Framebuffer
+ *  This file is subject to the terms and conditions of the GNU General Public
+ *  License. See the file COPYING in the main directory of this archive for
+ *  more details.
  */
 
-/*!
- * Include files
- */
 #include <linux/module.h>
 #include <linux/kernel.h>
-#include <linux/platform_device.h>
-#include <linux/sched.h>
 #include <linux/errno.h>
 #include <linux/string.h>
-#include <linux/interrupt.h>
-#include <linux/slab.h>
-#include <linux/fb.h>
+#include <linux/mm.h>
+#include <linux/vmalloc.h>
 #include <linux/delay.h>
+#include <linux/interrupt.h>
+#include <linux/platform_device.h>
+
+#include <linux/fb.h>
 #include <linux/init.h>
-#include <linux/ioport.h>
-#include <linux/dma-mapping.h>
-#include <linux/clk.h>
-#include <linux/console.h>
-#include <linux/io.h>
-#include <linux/uaccess.h>
-#include <asm/mach-types.h>
 
-/*
- * Driver name
- */
-#define VIRT_FB_NAME      "virtual_fb"
+    /*
+     *  RAM we reserve for the frame buffer. This defines the maximum screen
+     *  size
+     *
+     *  The default can be overridden if the driver is compiled as a module
+     */
 
+#define VIDEOMEMSIZE	(1*1024*1024)	/* 1 MB */
 
-static int vfbcount = 10;
-module_param(vfbcount, int, 0); 
-static struct fb_info ** g_fb_list;
+static void *videomemory;
+static u_long videomemorysize = VIDEOMEMSIZE;
+module_param(videomemorysize, ulong, 0);
+MODULE_PARM_DESC(videomemorysize, "RAM available to frame buffer (in bytes)");
 
-static int virtfb_map_video_memory(struct fb_info *fbi);
-static int virtfb_unmap_video_memory(struct fb_info *fbi);
+static char *mode_option = NULL;
+module_param(mode_option, charp, 0);
+MODULE_PARM_DESC(mode_option, "Preferred video mode (e.g. 640x480-8@60)");
 
-/*
- * Set fixed framebuffer parameters based on variable settings.
- *
- * @param       info     framebuffer information pointer
- */
-static int virtfb_set_fix(struct fb_info *info)
+static const struct fb_videomode vfb_default = {
+	.xres =		640,
+	.yres =		480,
+	.pixclock =	20000,
+	.left_margin =	64,
+	.right_margin =	64,
+	.upper_margin =	32,
+	.lower_margin =	32,
+	.hsync_len =	64,
+	.vsync_len =	2,
+	.vmode =	FB_VMODE_NONINTERLACED,
+};
+
+static struct fb_fix_screeninfo vfb_fix = {
+	.id =		"Virtual FB",
+	.type =		FB_TYPE_PACKED_PIXELS,
+	.visual =	FB_VISUAL_PSEUDOCOLOR,
+	.xpanstep =	1,
+	.ypanstep =	1,
+	.ywrapstep =	1,
+	.accel =	FB_ACCEL_NONE,
+};
+
+static bool vfb_enable __initdata = 0;	/* disabled by default */
+module_param(vfb_enable, bool, 0);
+MODULE_PARM_DESC(vfb_enable, "Enable Virtual FB driver");
+
+static int vfb_check_var(struct fb_var_screeninfo *var,
+			 struct fb_info *info);
+static int vfb_set_par(struct fb_info *info);
+static int vfb_setcolreg(u_int regno, u_int red, u_int green, u_int blue,
+			 u_int transp, struct fb_info *info);
+static int vfb_pan_display(struct fb_var_screeninfo *var,
+			   struct fb_info *info);
+static int vfb_mmap(struct fb_info *info,
+		    struct vm_area_struct *vma);
+
+static const struct fb_ops vfb_ops = {
+	.fb_read        = fb_sys_read,
+	.fb_write       = fb_sys_write,
+	.fb_check_var	= vfb_check_var,
+	.fb_set_par	= vfb_set_par,
+	.fb_setcolreg	= vfb_setcolreg,
+	.fb_pan_display	= vfb_pan_display,
+	.fb_fillrect	= sys_fillrect,
+	.fb_copyarea	= sys_copyarea,
+	.fb_imageblit	= sys_imageblit,
+	.fb_mmap	= vfb_mmap,
+};
+
+    /*
+     *  Internal routines
+     */
+
+static u_long get_line_length(int xres_virtual, int bpp)
 {
-	struct fb_fix_screeninfo *fix = &info->fix;
-	struct fb_var_screeninfo *var = &info->var;
+	u_long length;
 
-	fix->line_length = var->xres_virtual * var->bits_per_pixel / 8;
+	length = xres_virtual * bpp;
+	length = (length + 31) & ~31;
+	length >>= 3;
+	return (length);
+}
 
-	fix->type = FB_TYPE_PACKED_PIXELS;
-	fix->accel = FB_ACCEL_NONE;
-	fix->visual = FB_VISUAL_TRUECOLOR;
-	fix->xpanstep = 1;
-	fix->ywrapstep = 1;
-	fix->ypanstep = 1;
+    /*
+     *  Setting the video mode has been split into two parts.
+     *  First part, xxxfb_check_var, must not write anything
+     *  to hardware, it should only verify and adjust var.
+     *  This means it doesn't alter par but it does use hardware
+     *  data from it to check this var. 
+     */
+
+static int vfb_check_var(struct fb_var_screeninfo *var,
+			 struct fb_info *info)
+{
+	u_long line_length;
+
+	/*
+	 *  FB_VMODE_CONUPDATE and FB_VMODE_SMOOTH_XPAN are equal!
+	 *  as FB_VMODE_SMOOTH_XPAN is only used internally
+	 */
+
+	if (var->vmode & FB_VMODE_CONUPDATE) {
+		var->vmode |= FB_VMODE_YWRAP;
+		var->xoffset = info->var.xoffset;
+		var->yoffset = info->var.yoffset;
+	}
+
+	/*
+	 *  Some very basic checks
+	 */
+	if (!var->xres)
+		var->xres = 1;
+	if (!var->yres)
+		var->yres = 1;
+	if (var->xres > var->xres_virtual)
+		var->xres_virtual = var->xres;
+	if (var->yres > var->yres_virtual)
+		var->yres_virtual = var->yres;
+	if (var->bits_per_pixel <= 1)
+		var->bits_per_pixel = 1;
+	else if (var->bits_per_pixel <= 8)
+		var->bits_per_pixel = 8;
+	else if (var->bits_per_pixel <= 16)
+		var->bits_per_pixel = 16;
+	else if (var->bits_per_pixel <= 24)
+		var->bits_per_pixel = 24;
+	else if (var->bits_per_pixel <= 32)
+		var->bits_per_pixel = 32;
+	else
+		return -EINVAL;
+
+	if (var->xres_virtual < var->xoffset + var->xres)
+		var->xres_virtual = var->xoffset + var->xres;
+	if (var->yres_virtual < var->yoffset + var->yres)
+		var->yres_virtual = var->yoffset + var->yres;
+
+	/*
+	 *  Memory limit
+	 */
+	line_length =
+	    get_line_length(var->xres_virtual, var->bits_per_pixel);
+	if (line_length * var->yres_virtual > videomemorysize)
+		return -ENOMEM;
+
+	/*
+	 * Now that we checked it we alter var. The reason being is that the video
+	 * mode passed in might not work but slight changes to it might make it 
+	 * work. This way we let the user know what is acceptable.
+	 */
+	switch (var->bits_per_pixel) {
+	case 1:
+	case 8:
+		var->red.offset = 0;
+		var->red.length = 8;
+		var->green.offset = 0;
+		var->green.length = 8;
+		var->blue.offset = 0;
+		var->blue.length = 8;
+		var->transp.offset = 0;
+		var->transp.length = 0;
+		break;
+	case 16:		/* RGBA 5551 */
+		if (var->transp.length) {
+			var->red.offset = 0;
+			var->red.length = 5;
+			var->green.offset = 5;
+			var->green.length = 5;
+			var->blue.offset = 10;
+			var->blue.length = 5;
+			var->transp.offset = 15;
+			var->transp.length = 1;
+		} else {	/* RGB 565 */
+			var->red.offset = 0;
+			var->red.length = 5;
+			var->green.offset = 5;
+			var->green.length = 6;
+			var->blue.offset = 11;
+			var->blue.length = 5;
+			var->transp.offset = 0;
+			var->transp.length = 0;
+		}
+		break;
+	case 24:		/* RGB 888 */
+		var->red.offset = 0;
+		var->red.length = 8;
+		var->green.offset = 8;
+		var->green.length = 8;
+		var->blue.offset = 16;
+		var->blue.length = 8;
+		var->transp.offset = 0;
+		var->transp.length = 0;
+		break;
+	case 32:		/* RGBA 8888 */
+		var->red.offset = 0;
+		var->red.length = 8;
+		var->green.offset = 8;
+		var->green.length = 8;
+		var->blue.offset = 16;
+		var->blue.length = 8;
+		var->transp.offset = 24;
+		var->transp.length = 8;
+		break;
+	}
+	var->red.msb_right = 0;
+	var->green.msb_right = 0;
+	var->blue.msb_right = 0;
+	var->transp.msb_right = 0;
 
 	return 0;
 }
 
-
-/*
- * Set framebuffer parameters and change the operating mode.
- *
- * @param       info     framebuffer information pointer
+/* This routine actually sets the video mode. It's in here where we
+ * the hardware state info->par and fix which can be affected by the 
+ * change in par. For this driver it doesn't do much. 
  */
-static int virtfb_set_par(struct fb_info *fbi)
+static int vfb_set_par(struct fb_info *info)
 {
-	int retval = 0;
-	u32 mem_len;
-
-	dev_dbg(fbi->device, "Reconfiguring framebuffer\n");
-
-	virtfb_set_fix(fbi);
-
-	mem_len = fbi->var.yres_virtual * fbi->fix.line_length;
-	if (!fbi->fix.smem_start || (mem_len > fbi->fix.smem_len)) {
-		if (fbi->fix.smem_start)
-			virtfb_unmap_video_memory(fbi);
-
-		if (virtfb_map_video_memory(fbi) < 0)
-			return -ENOMEM;
+	switch (info->var.bits_per_pixel) {
+	case 1:
+		info->fix.visual = FB_VISUAL_MONO01;
+		break;
+	case 8:
+		info->fix.visual = FB_VISUAL_PSEUDOCOLOR;
+		break;
+	case 16:
+	case 24:
+	case 32:
+		info->fix.visual = FB_VISUAL_TRUECOLOR;
+		break;
 	}
 
+	info->fix.line_length = get_line_length(info->var.xres_virtual,
+						info->var.bits_per_pixel);
 
+	return 0;
+}
+
+    /*
+     *  Set a single color register. The values supplied are already
+     *  rounded down to the hardware's capabilities (according to the
+     *  entries in the var structure). Return != 0 for invalid regno.
+     */
+
+static int vfb_setcolreg(u_int regno, u_int red, u_int green, u_int blue,
+			 u_int transp, struct fb_info *info)
+{
+	if (regno >= 256)	/* no. of hw registers */
+		return 1;
+	/*
+	 * Program hardware... do anything you want with transp
+	 */
+
+	/* grayscale works only partially under directcolor */
+	if (info->var.grayscale) {
+		/* grayscale = 0.30*R + 0.59*G + 0.11*B */
+		red = green = blue =
+		    (red * 77 + green * 151 + blue * 28) >> 8;
+	}
+
+	/* Directcolor:
+	 *   var->{color}.offset contains start of bitfield
+	 *   var->{color}.length contains length of bitfield
+	 *   {hardwarespecific} contains width of RAMDAC
+	 *   cmap[X] is programmed to (X << red.offset) | (X << green.offset) | (X << blue.offset)
+	 *   RAMDAC[X] is programmed to (red, green, blue)
+	 *
+	 * Pseudocolor:
+	 *    var->{color}.offset is 0 unless the palette index takes less than
+	 *                        bits_per_pixel bits and is stored in the upper
+	 *                        bits of the pixel value
+	 *    var->{color}.length is set so that 1 << length is the number of available
+	 *                        palette entries
+	 *    cmap is not used
+	 *    RAMDAC[X] is programmed to (red, green, blue)
+	 *
+	 * Truecolor:
+	 *    does not use DAC. Usually 3 are present.
+	 *    var->{color}.offset contains start of bitfield
+	 *    var->{color}.length contains length of bitfield
+	 *    cmap is programmed to (red << red.offset) | (green << green.offset) |
+	 *                      (blue << blue.offset) | (transp << transp.offset)
+	 *    RAMDAC does not exist
+	 */
+#define CNVT_TOHW(val,width) ((((val)<<(width))+0x7FFF-(val))>>16)
+	switch (info->fix.visual) {
+	case FB_VISUAL_TRUECOLOR:
+	case FB_VISUAL_PSEUDOCOLOR:
+		red = CNVT_TOHW(red, info->var.red.length);
+		green = CNVT_TOHW(green, info->var.green.length);
+		blue = CNVT_TOHW(blue, info->var.blue.length);
+		transp = CNVT_TOHW(transp, info->var.transp.length);
+		break;
+	case FB_VISUAL_DIRECTCOLOR:
+		red = CNVT_TOHW(red, 8);	/* expect 8 bit DAC */
+		green = CNVT_TOHW(green, 8);
+		blue = CNVT_TOHW(blue, 8);
+		/* hey, there is bug in transp handling... */
+		transp = CNVT_TOHW(transp, 8);
+		break;
+	}
+#undef CNVT_TOHW
+	/* Truecolor has hardware independent palette */
+	if (info->fix.visual == FB_VISUAL_TRUECOLOR) {
+		u32 v;
+
+		if (regno >= 16)
+			return 1;
+
+		v = (red << info->var.red.offset) |
+		    (green << info->var.green.offset) |
+		    (blue << info->var.blue.offset) |
+		    (transp << info->var.transp.offset);
+		switch (info->var.bits_per_pixel) {
+		case 8:
+			break;
+		case 16:
+			((u32 *) (info->pseudo_palette))[regno] = v;
+			break;
+		case 24:
+		case 32:
+			((u32 *) (info->pseudo_palette))[regno] = v;
+			break;
+		}
+		return 0;
+	}
+	return 0;
+}
+
+    /*
+     *  Pan or Wrap the Display
+     *
+     *  This call looks only at xoffset, yoffset and the FB_VMODE_YWRAP flag
+     */
+
+static int vfb_pan_display(struct fb_var_screeninfo *var,
+			   struct fb_info *info)
+{
+	if (var->vmode & FB_VMODE_YWRAP) {
+		if (var->yoffset >= info->var.yres_virtual ||
+		    var->xoffset)
+			return -EINVAL;
+	} else {
+		if (var->xoffset + info->var.xres > info->var.xres_virtual ||
+		    var->yoffset + info->var.yres > info->var.yres_virtual)
+			return -EINVAL;
+	}
+	info->var.xoffset = var->xoffset;
+	info->var.yoffset = var->yoffset;
+	if (var->vmode & FB_VMODE_YWRAP)
+		info->var.vmode |= FB_VMODE_YWRAP;
+	else
+		info->var.vmode &= ~FB_VMODE_YWRAP;
+	return 0;
+}
+
+    /*
+     *  Most drivers don't need their own mmap function 
+     */
+
+static int vfb_mmap(struct fb_info *info,
+		    struct vm_area_struct *vma)
+{
+	return remap_vmalloc_range(vma, (void *)info->fix.smem_start, vma->vm_pgoff);
+}
+
+#ifndef MODULE
+/*
+ * The virtual framebuffer driver is only enabled if explicitly
+ * requested by passing 'video=vfb:' (or any actual options).
+ */
+static int __init vfb_setup(char *options)
+{
+	char *this_opt;
+
+	vfb_enable = 0;
+
+	if (!options)
+		return 1;
+
+	vfb_enable = 1;
+
+	if (!*options)
+		return 1;
+
+	while ((this_opt = strsep(&options, ",")) != NULL) {
+		if (!*this_opt)
+			continue;
+		/* Test disable for backwards compatibility */
+		if (!strcmp(this_opt, "disable"))
+			vfb_enable = 0;
+		else
+			mode_option = this_opt;
+	}
+	return 1;
+}
+#endif  /*  MODULE  */
+
+    /*
+     *  Initialisation
+     */
+
+static int vfb_probe(struct platform_device *dev)
+{
+	struct fb_info *info;
+	unsigned int size = PAGE_ALIGN(videomemorysize);
+	int retval = -ENOMEM;
+
+	/*
+	 * For real video cards we use ioremap.
+	 */
+	if (!(videomemory = vmalloc_32_user(size)))
+		return retval;
+
+	info = framebuffer_alloc(sizeof(u32) * 256, &dev->dev);
+	if (!info)
+		goto err;
+
+	info->screen_base = (char __iomem *)videomemory;
+	info->fbops = &vfb_ops;
+
+	if (!fb_find_mode(&info->var, info, mode_option,
+			  NULL, 0, &vfb_default, 8)){
+		fb_err(info, "Unable to find usable video mode.\n");
+		retval = -EINVAL;
+		goto err1;
+	}
+
+	vfb_fix.smem_start = (unsigned long) videomemory;
+	vfb_fix.smem_len = videomemorysize;
+	info->fix = vfb_fix;
+	info->pseudo_palette = info->par;
+	info->par = NULL;
+	info->flags = FBINFO_FLAG_DEFAULT;
+
+	retval = fb_alloc_cmap(&info->cmap, 256, 0);
+	if (retval < 0)
+		goto err1;
+
+	retval = register_framebuffer(info);
+	if (retval < 0)
+		goto err2;
+	platform_set_drvdata(dev, info);
+
+	vfb_set_par(info);
+
+	fb_info(info, "Virtual frame buffer device, using %ldK of video memory\n",
+		videomemorysize >> 10);
+	return 0;
+err2:
+	fb_dealloc_cmap(&info->cmap);
+err1:
+	framebuffer_release(info);
+err:
+	vfree(videomemory);
 	return retval;
 }
 
-
-/*
- * Check framebuffer variable parameters and adjust to valid values.
- *
- * @param       var      framebuffer variable parameters
- *
- * @param       info     framebuffer information pointer
- */
-static int virtfb_check_var(struct fb_var_screeninfo *var, struct fb_info *info)
+static int vfb_remove(struct platform_device *dev)
 {
+	struct fb_info *info = platform_get_drvdata(dev);
 
-	/* fg should not bigger than bg */
-
-	if (var->xres_virtual < var->xres)
-		var->xres_virtual = var->xres;
-
-	if (var->yres_virtual < var->yres)
-		var->yres_virtual = var->yres;
-
-	if ((var->bits_per_pixel != 32) && (var->bits_per_pixel != 24) &&
-	    (var->bits_per_pixel != 16) && (var->bits_per_pixel != 12) &&
-	    (var->bits_per_pixel != 8))
-		var->bits_per_pixel = 16;
-
-	switch (var->bits_per_pixel) {
-	case 8:
-		var->red.length = 3;
-		var->red.offset = 5;
-		var->red.msb_right = 0;
-
-		var->green.length = 3;
-		var->green.offset = 2;
-		var->green.msb_right = 0;
-
-		var->blue.length = 2;
-		var->blue.offset = 0;
-		var->blue.msb_right = 0;
-
-		var->transp.length = 0;
-		var->transp.offset = 0;
-		var->transp.msb_right = 0;
-		break;
-	case 16:
-		var->red.length = 5;
-		var->red.offset = 11;
-		var->red.msb_right = 0;
-
-		var->green.length = 6;
-		var->green.offset = 5;
-		var->green.msb_right = 0;
-
-		var->blue.length = 5;
-		var->blue.offset = 0;
-		var->blue.msb_right = 0;
-
-		var->transp.length = 0;
-		var->transp.offset = 0;
-		var->transp.msb_right = 0;
-		break;
-	case 24:
-		var->red.length = 8;
-		var->red.offset = 16;
-		var->red.msb_right = 0;
-
-		var->green.length = 8;
-		var->green.offset = 8;
-		var->green.msb_right = 0;
-
-		var->blue.length = 8;
-		var->blue.offset = 0;
-		var->blue.msb_right = 0;
-
-		var->transp.length = 0;
-		var->transp.offset = 0;
-		var->transp.msb_right = 0;
-		break;
-	case 32:
-		var->red.length = 8;
-		var->red.offset = 16;
-		var->red.msb_right = 0;
-
-		var->green.length = 8;
-		var->green.offset = 8;
-		var->green.msb_right = 0;
-
-		var->blue.length = 8;
-		var->blue.offset = 0;
-		var->blue.msb_right = 0;
-
-		var->transp.length = 8;
-		var->transp.offset = 24;
-		var->transp.msb_right = 0;
-		break;
+	if (info) {
+		unregister_framebuffer(info);
+		vfree(videomemory);
+		fb_dealloc_cmap(&info->cmap);
+		framebuffer_release(info);
 	}
-
-	var->height = -1;
-	var->width = -1;
-	var->grayscale = 0;
-
 	return 0;
 }
 
-/*
- * Pan or Wrap the Display
- *
- * This call looks only at xoffset, yoffset and the FB_VMODE_YWRAP flag
- *
- * @param               var     Variable screen buffer information
- * @param               info    Framebuffer information pointer
- */
-static int
-virtfb_pan_display(struct fb_var_screeninfo *var, struct fb_info *info)
-{
-
-	if (info->var.yoffset == var->yoffset)
-		return 0;	/* No change, do nothing */
-
-	if ((var->yoffset + info->var.yres) > info->var.yres_virtual)
-		return -EINVAL;
-
-	info->var.yoffset = var->yoffset;
-
-	return 0;
-}
-
-/*
- * Function to handle custom mmap for virtual framebuffer.
- *
- * @param       fbi     framebuffer information pointer
- *
- * @param       vma     Pointer to vm_area_struct
- */
-static int virtfb_mmap(struct fb_info *fbi, struct vm_area_struct *vma)
-{
-	u32 len;
-	unsigned long offset = vma->vm_pgoff << PAGE_SHIFT;
-
-	if (offset < fbi->fix.smem_len) {
-		/* mapping framebuffer memory */
-		len = fbi->fix.smem_len - offset;
-		vma->vm_pgoff = (fbi->fix.smem_start + offset) >> PAGE_SHIFT;
-	} else {
-		return -EINVAL;
-	}
-
-	len = PAGE_ALIGN(len);
-	if (vma->vm_end - vma->vm_start > len)
-		return -EINVAL;
-
-	/* make buffers bufferable */
-	vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
-
-	vma->vm_flags |= VM_IO | VM_RESERVED;
-
-	if (remap_pfn_range(vma, vma->vm_start, vma->vm_pgoff,
-			    vma->vm_end - vma->vm_start, vma->vm_page_prot)) {
-		dev_dbg(fbi->device, "mmap remap_pfn_range failed\n");
-		return -ENOBUFS;
-	}
-
-	return 0;
-}
-
-/*!
- * This structure contains the pointers to the control functions that are
- * invoked by the core framebuffer driver to perform operations like
- * blitting, rectangle filling, copy regions and cursor definition.
- */
-static struct fb_ops virtfb_ops = {
-	.owner = THIS_MODULE,
-	.fb_set_par = virtfb_set_par,
-	.fb_check_var = virtfb_check_var,
-	.fb_pan_display = virtfb_pan_display,
-	.fb_mmap = virtfb_mmap,
+static struct platform_driver vfb_driver = {
+	.probe	= vfb_probe,
+	.remove = vfb_remove,
+	.driver = {
+		.name	= "vfb",
+	},
 };
 
+static struct platform_device *vfb_device;
 
-/*
- * Main framebuffer functions
- */
-
-/*!
- * Allocates the DRAM memory for the frame buffer.      This buffer is remapped
- * into a non-cached, non-buffered, memory region to allow palette and pixel
- * writes to occur without flushing the cache.  Once this area is remapped,
- * all virtual memory access to the video memory should occur at the new region.
- *
- * @param       fbi     framebuffer information pointer
- *
- * @return      Error code indicating success or failure
- */
-static int virtfb_map_video_memory(struct fb_info *fbi)
+static int __init vfb_init(void)
 {
-	if (fbi->fix.smem_len < fbi->var.yres_virtual * fbi->fix.line_length)
-		fbi->fix.smem_len = fbi->var.yres_virtual *
-				    fbi->fix.line_length;
-
-	fbi->screen_base = dma_alloc_writecombine(fbi->device,
-				fbi->fix.smem_len,
-				(dma_addr_t *)&fbi->fix.smem_start,
-				GFP_DMA);
-	if (fbi->screen_base == 0) {
-		dev_err(fbi->device, "Unable to allocate framebuffer memory\n");
-		fbi->fix.smem_len = 0;
-		fbi->fix.smem_start = 0;
-		return -EBUSY;
-	}
-
-	dev_dbg(fbi->device, "allocated fb @ paddr=0x%08X, size=%d.\n",
-		(uint32_t) fbi->fix.smem_start, fbi->fix.smem_len);
-
-	fbi->screen_size = fbi->fix.smem_len;
-
-	/* Clear the screen */
-	memset((char *)fbi->screen_base, 0, fbi->fix.smem_len);
-
-	return 0;
-}
-
-/*!
- * De-allocates the DRAM memory for the frame buffer.
- *
- * @param       fbi     framebuffer information pointer
- *
- * @return      Error code indicating success or failure
- */
-static int virtfb_unmap_video_memory(struct fb_info *fbi)
-{
-	dma_free_writecombine(fbi->device, fbi->fix.smem_len,
-			      fbi->screen_base, fbi->fix.smem_start);
-	fbi->screen_base = 0;
-	fbi->fix.smem_start = 0;
-	fbi->fix.smem_len = 0;
-	return 0;
-}
-
-/*!
- * Initializes the framebuffer information pointer. After allocating
- * sufficient memory for the framebuffer structure, the fields are
- * filled with custom information passed in from the configurable
- * structures.  This includes information such as bits per pixel,
- * color maps, screen width/height and RGBA offsets.
- *
- * @return      Framebuffer structure initialized with our information
- */
-static struct fb_info *virtfb_init_fbinfo(struct fb_ops *ops)
-{
-	struct fb_info *fbi;
-
-	/*
-	 * Allocate sufficient memory for the fb structure
-	 */
-	fbi = framebuffer_alloc(sizeof(unsigned int), NULL);
-	if (!fbi)
-		return NULL;
-
-
-	fbi->var.activate = FB_ACTIVATE_NOW;
-
-	fbi->fbops = ops;
-	fbi->flags = FBINFO_FLAG_DEFAULT;
-
-
-	return fbi;
-}
-
-
-static int virtfb_register(struct fb_info *fbi, unsigned int id)
-{
-	struct fb_videomode m;
 	int ret = 0;
 
-	//TODO: Set framebuffer ID
-	sprintf(fbi->fix.id, "virt_fb%d", id);
+#ifndef MODULE
+	char *option = NULL;
 
-	//Setup small default resolution
-	fbi->var.xres_virtual = fbi->var.xres = fbi->var.yres_virtual = fbi->var.yres  = 128;
-	fbi->var.bits_per_pixel = 16;
+	if (fb_get_options("vfb", &option))
+		return -ENODEV;
+	vfb_setup(option);
+#endif
 
-	virtfb_check_var(&fbi->var, fbi);
+	if (!vfb_enable)
+		return -ENXIO;
 
-	virtfb_set_fix(fbi);
+	ret = platform_driver_register(&vfb_driver);
 
-	/*added first mode to fbi modelist*/
-	if (!fbi->modelist.next || !fbi->modelist.prev)
-		INIT_LIST_HEAD(&fbi->modelist);
-	fb_var_to_videomode(&m, &fbi->var);
-	fb_add_videomode(&m, &fbi->modelist);
+	if (!ret) {
+		vfb_device = platform_device_alloc("vfb", 0);
 
-	fbi->var.activate |= FB_ACTIVATE_FORCE;
-	console_lock();
-	fbi->flags |= FBINFO_MISC_USEREVENT;
-	ret = fb_set_var(fbi, &fbi->var);
-	fbi->flags &= ~FBINFO_MISC_USEREVENT;
-	console_unlock();
+		if (vfb_device)
+			ret = platform_device_add(vfb_device);
+		else
+			ret = -ENOMEM;
 
-
-	ret = register_framebuffer(fbi);
-	if (ret < 0)
-		goto err0;
-
-	return ret;
-err0:
-	return ret;
-}
-
-static void virtfb_unregister(struct fb_info *fbi)
-{
-
-	unregister_framebuffer(fbi);
-}
-
-/*!
- * Main entry function for the framebuffer. The function registers the power
- * management callback functions with the kernel and also registers the MXCFB
- * callback functions with the core Linux framebuffer driver \b fbmem.c
- *
- * @return      Error code indicating success or failure
- */
-int __init virtfb_init(void)
-{
-	
-        u32 *  fbNum;
-        int  i, ret = 0;
-
-        /*
-         * Initialize FB structures
-         */
-
-	g_fb_list = kzalloc(sizeof(struct fb_info*) * vfbcount, GFP_KERNEL);
-        for(i=0;i<vfbcount;i++)
-        {
-                g_fb_list[i] = virtfb_init_fbinfo(&virtfb_ops);
-                if (!g_fb_list[i]) {
-                        ret = -ENOMEM;
-                        goto init_fbinfo_failed;
-                }
-
-                fbNum = (u32*)g_fb_list[i]->par;
-                *fbNum = i;
-
-                ret = virtfb_register(g_fb_list[i], i);
-                if (ret < 0)
-                        goto virtfb_register_failed;
-        }
-
-
-        return 0;
-virtfb_register_failed:
-init_fbinfo_failed:
-        for(i=0;i<vfbcount;i++)
-	{
-		if(g_fb_list[i])
-		{
-			virtfb_unregister(g_fb_list[i]);
-        		framebuffer_release(g_fb_list[i]);
-		}
-	}
-        return ret;
-
-}
-
-void virtfb_exit(void)
-{
-
-	int i;
-
-        for(i=0;i<vfbcount;i++)
-	{
-		if(g_fb_list[i])
-		{
-			virtfb_unregister(g_fb_list[i]);
-			virtfb_unmap_video_memory(g_fb_list[i]);
-
-			framebuffer_release(g_fb_list[i]);
+		if (ret) {
+			platform_device_put(vfb_device);
+			platform_driver_unregister(&vfb_driver);
 		}
 	}
 
-
+	return ret;
 }
 
-module_init(virtfb_init);
-module_exit(virtfb_exit);
+module_init(vfb_init);
 
-MODULE_AUTHOR("Freescale Semiconductor, Inc.");
-MODULE_DESCRIPTION("Virtual framebuffer driver");
+#ifdef MODULE
+static void __exit vfb_exit(void)
+{
+	platform_device_unregister(vfb_device);
+	platform_driver_unregister(&vfb_driver);
+}
+
+module_exit(vfb_exit);
+
 MODULE_LICENSE("GPL");
-MODULE_SUPPORTED_DEVICE("fb");
+#endif				/* MODULE */
